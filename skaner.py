@@ -2,16 +2,13 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import random
-import select
 import socket
 import struct
 import sys
 import time
 
-# Полезные нагрузки (payloads) для определения протоколов (-g)
 ECHO_PAYLOAD = b"PORTSCAN_ECHO_TEST_42\r\n"
 DNS_TID = b"\x13\x37"
-# Стандартный DNS-запрос (A-запись для example.com)
 DNS_QUERY = (
     DNS_TID
     + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
@@ -20,19 +17,20 @@ DNS_QUERY = (
 
 
 def calculate_checksum(data: bytes) -> int:
-    """Вычисление контрольной суммы RFC 1071 (для TCP заголовка)."""
     if len(data) % 2 != 0:
         data += b"\x00"
     checksum = 0
     for i in range(0, len(data), 2):
         word = (data[i] << 8) + data[i + 1]
         checksum += word
+
+    while checksum >> 16:
         checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
     return ~checksum & 0xFFFF
 
 
 def get_local_ip(target_ip: str) -> str:
-    """Определяет локальный IP-адрес интерфейса, через который идет маршрут к цели."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.connect((target_ip, 80))
@@ -50,13 +48,11 @@ def build_tcp_packet(
     ack_seq: int,
     flags: int,
 ) -> bytes:
-    """Ручная сборка TCP-заголовка с вычислением контрольной суммы."""
-    data_offset = 5 << 4  # 5 слов по 32 бита = 20 байт (без опций)
+    data_offset = 5 << 4
     window = socket.htons(5840)
     checksum = 0
     urg_ptr = 0
 
-    # Собираем заголовок с нулевой контрольной суммой
     tcp_header = struct.pack(
         "!HHIIBBHHH",
         src_port,
@@ -70,7 +66,6 @@ def build_tcp_packet(
         urg_ptr,
     )
 
-    # Псевдозаголовок IPv4 для расчета контрольной суммы TCP
     src_ip_bytes = socket.inet_aton(src_ip)
     dst_ip_bytes = socket.inet_aton(dst_ip)
     placeholder = 0
@@ -88,7 +83,6 @@ def build_tcp_packet(
 
     checksum = calculate_checksum(pseudo_header + tcp_header)
 
-    # Пересобираем заголовок с правильной контрольной суммой
     tcp_header = struct.pack(
         "!HHIIBBHHH",
         src_port,
@@ -107,14 +101,9 @@ def build_tcp_packet(
 def scan_tcp_syn(
     local_ip: str, target_ip: str, port: int, timeout: float
 ) -> tuple[bool, int]:
-    """TCP SYN сканирование (полуоткрытое).
-
-    Возвращает (is_open, rtt_ms).
-    """
     src_port = random.randint(32768, 60999)
     seq = random.randint(1000, 1000000)
 
-    # Флаг SYN = 0x02
     syn_packet = build_tcp_packet(
         local_ip, target_ip, src_port, port, seq, 0, 0x02
     )
@@ -131,15 +120,15 @@ def scan_tcp_syn(
             if remaining <= 0:
                 return False, 0
 
-            ready, _, _ = select.select([sock], [], [], remaining)
-            if not ready:
+            sock.settimeout(remaining)
+            try:
+                packet, addr = sock.recvfrom(65535)
+            except (socket.timeout, TimeoutError):
                 return False, 0
 
-            packet, addr = sock.recvfrom(1024)
             if addr[0] != target_ip:
                 continue
 
-            # Длина IP-заголовка (IHL) находится в младших 4 битах первого байта
             ip_header_len = (packet[0] & 0x0F) * 4
             if len(packet) < ip_header_len + 20:
                 continue
@@ -149,27 +138,28 @@ def scan_tcp_syn(
                 struct.unpack("!HHIIBBHHH", tcp_header)
             )
 
-            # Проверяем, что пакет адресован именно нашему потоку и от нужного порта
             if r_src_port == port and r_dst_port == src_port:
                 rtt_ms = int(round((time.perf_counter() - start_time) * 1000))
 
-                # Если пришли флаги SYN (0x02) + ACK (0x10) = 0x12 -> Порт ОТКРЫТ
                 if (r_flags & 0x12) == 0x12:
-                    # Отправляем RST (0x04), чтобы закрыть полуоткрытое соединение!
                     rst_packet = build_tcp_packet(
-                        local_ip, target_ip, src_port, port, r_ack, 0, 0x04
+                        local_ip,
+                        target_ip,
+                        src_port,
+                        port,
+                        r_ack,
+                        (r_seq + 1) & 0xFFFFFFFF,
+                        0x14,
                     )
                     sock.sendto(rst_packet, (target_ip, port))
                     return True, rtt_ms
 
-                # Если пришел флаг RST (0x04) -> Порт ЗАКРЫТ
                 if (r_flags & 0x04) != 0:
                     return False, 0
 
 
 def guess_tcp_protocol(target_ip: str, port: int, timeout: float) -> str:
-    """Определение протокола прикладного уровня поверх TCP (ECHO, HTTP, DNS)."""
-    # 1. Проверка на ECHO
+    #Проверка на ECHO
     try:
         with socket.create_connection((target_ip, port), timeout=timeout) as s:
             s.settimeout(timeout)
@@ -180,7 +170,7 @@ def guess_tcp_protocol(target_ip: str, port: int, timeout: float) -> str:
     except Exception:
         pass
 
-    # 2. Проверка на HTTP
+    #Проверка на HTTP
     try:
         with socket.create_connection((target_ip, port), timeout=timeout) as s:
             s.settimeout(timeout)
@@ -192,14 +182,13 @@ def guess_tcp_protocol(target_ip: str, port: int, timeout: float) -> str:
     except Exception:
         pass
 
-    # 3. Проверка на DNS (поверх TCP перед запросом идет 2 байта длины)
+    #Проверка на DNS
     try:
         with socket.create_connection((target_ip, port), timeout=timeout) as s:
             s.settimeout(timeout)
             tcp_dns_req = struct.pack("!H", len(DNS_QUERY)) + DNS_QUERY
             s.sendall(tcp_dns_req)
             resp = s.recv(1024)
-            # Проверяем Transaction ID и бит ответа QR (0x80)
             if (
                 len(resp) >= 14
                 and resp[2:4] == DNS_TID
@@ -213,7 +202,6 @@ def guess_tcp_protocol(target_ip: str, port: int, timeout: float) -> str:
 
 
 def check_udp_response_protocol(resp: bytes) -> str:
-    """Анализирует ответный UDP-пакет на принадлежность к ECHO, DNS или HTTP."""
     if resp == ECHO_PAYLOAD:
         return "ECHO"
     if len(resp) >= 12 and resp[0:2] == DNS_TID and (resp[2] & 0x80) != 0:
@@ -226,10 +214,6 @@ def check_udp_response_protocol(resp: bytes) -> str:
 def scan_udp(
     target_ip: str, port: int, timeout: float, guess: bool
 ) -> tuple[bool, str]:
-    """UDP сканирование с перехватом ICMP Port Unreachable и угадыванием протокола.
-
-    Возвращает (is_open, protocol).
-    """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock, (
         socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     ) as icmp_sock:
@@ -237,7 +221,10 @@ def scan_udp(
         udp_sock.bind(("", 0))
         src_port = udp_sock.getsockname()[1]
 
-        # Формируем список пакетов для отправки
+        poll_timeout = 0.05
+        udp_sock.settimeout(poll_timeout)
+        icmp_sock.settimeout(poll_timeout)
+
         http_req = f"GET / HTTP/1.1\r\nHost: {target_ip}\r\n\r\n".encode()
         probes = [DNS_QUERY, ECHO_PAYLOAD, http_req] if guess else [DNS_QUERY]
 
@@ -246,62 +233,54 @@ def scan_udp(
             udp_sock.sendto(probe, (target_ip, port))
 
         while True:
-            elapsed = time.perf_counter() - start_time
-            remaining = timeout - elapsed
-            if remaining <= 0:
-                # За время таймаута ICMP-ошибка "Порт недоступен" НЕ пришла -> порт открыт (или отфильтрован)
+            if time.perf_counter() - start_time >= timeout:
                 return True, "-"
 
-            ready, _, _ = select.select(
-                [udp_sock, icmp_sock], [], [], remaining
-            )
-            if not ready:
-                return True, "-"
+            try:
+                data, addr = udp_sock.recvfrom(65535)
+                if addr[0] == target_ip and addr[1] == port:
+                    proto = (
+                        check_udp_response_protocol(data) if guess else "-"
+                    )
+                    return True, proto
+            except (socket.timeout, TimeoutError):
+                pass
+            except Exception:
+                return False, "-"
 
-            # Если пришел прямой UDP-ответ, порт точно ОТКРЫТ
-            if udp_sock in ready:
-                try:
-                    data, addr = udp_sock.recvfrom(2048)
-                    if addr[0] == target_ip and addr[1] == port:
-                        proto = (
-                            check_udp_response_protocol(data) if guess else "-"
+            try:
+                packet, addr = icmp_sock.recvfrom(65535)
+                if addr[0] == target_ip:
+                    ip_hdr_len = (packet[0] & 0x0F) * 4
+                    icmp_packet = packet[ip_hdr_len:]
+                    if len(icmp_packet) >= 8:
+                        icmp_type, icmp_code = struct.unpack(
+                            "!BB", icmp_packet[:2]
                         )
-                        return True, proto
-                except Exception:
-                    return False, "-"
 
-            # Если пришел ICMP-пакет, проверяем не Destination/Port Unreachable ли это
-            if icmp_sock in ready:
-                packet, addr = icmp_sock.recvfrom(2048)
-                if addr[0] != target_ip:
-                    continue
-
-                ip_hdr_len = (packet[0] & 0x0F) * 4
-                icmp_packet = packet[ip_hdr_len:]
-                if len(icmp_packet) < 8:
-                    continue
-
-                icmp_type, icmp_code = struct.unpack("!BB", icmp_packet[:2])
-                # Type 3 (Destination Unreachable), Code 3 (Port Unreachable)
-                if icmp_type == 3 and icmp_code == 3:
-                    # Внутри ICMP-пакета лежит IP-заголовок и первые 8 байт нашего исходного UDP-пакета
-                    orig_ip_pkt = icmp_packet[8:]
-                    if len(orig_ip_pkt) < 20:
-                        continue
-                    orig_ip_hdr_len = (orig_ip_pkt[0] & 0x0F) * 4
-                    orig_udp_hdr = orig_ip_pkt[
-                        orig_ip_hdr_len : orig_ip_hdr_len + 8
-                    ]
-                    if len(orig_udp_hdr) >= 4:
-                        orig_src_p, orig_dst_p = struct.unpack(
-                            "!HH", orig_udp_hdr[:4]
-                        )
-                        if orig_src_p == src_port and orig_dst_p == port:
-                            return False, "-"
+                        if icmp_type == 3 and icmp_code == 3:
+                            orig_ip_pkt = icmp_packet[8:]
+                            if len(orig_ip_pkt) >= 20:
+                                orig_ip_hdr_len = (orig_ip_pkt[0] & 0x0F) * 4
+                                orig_udp_hdr = orig_ip_pkt[
+                                    orig_ip_hdr_len : orig_ip_hdr_len + 8
+                                ]
+                                if len(orig_udp_hdr) >= 4:
+                                    orig_src_p, orig_dst_p = struct.unpack(
+                                        "!HH", orig_udp_hdr[:4]
+                                    )
+                                    if (
+                                        orig_src_p == src_port
+                                        and orig_dst_p == port
+                                    ):
+                                        return False, "-"
+            except (socket.timeout, TimeoutError):
+                pass
+            except Exception:
+                pass
 
 
 def parse_target_specs(specs: list[str]) -> list[tuple[str, int]]:
-    """Парсит аргументы вида: tcp/80, tcp/12000-12500, udp/3000-3100,3200, tcp."""
     tasks = []
     seen = set()
 
@@ -349,34 +328,35 @@ def process_task(
     verbose: bool,
     guess: bool,
 ) -> str | None:
-    """Обрабатывает один порт и возвращает отформатированную строку вывода (если открыт)."""
     proto, port = task
 
-    if proto == "TCP":
-        is_open, rtt_ms = scan_tcp_syn(local_ip, target_ip, port, timeout)
-        if not is_open:
-            return None
-        app_proto = (
-            guess_tcp_protocol(target_ip, port, timeout) if guess else ""
-        )
+    try:
+        if proto == "TCP":
+            is_open, rtt_ms = scan_tcp_syn(local_ip, target_ip, port, timeout)
+            if not is_open:
+                return None
+            app_proto = (
+                guess_tcp_protocol(target_ip, port, timeout) if guess else ""
+            )
 
-        parts = ["TCP", str(port)]
-        if verbose:
-            parts.append(str(rtt_ms))
-        if guess:
-            parts.append(app_proto)
-        return " ".join(parts)
+            parts = ["TCP", str(port)]
+            if verbose:
+                parts.append(str(rtt_ms))
+            if guess:
+                parts.append(app_proto)
+            return " ".join(parts)
 
-    else:  # UDP
-        is_open, app_proto = scan_udp(target_ip, port, timeout, guess)
-        if not is_open:
-            return None
+        else:
+            is_open, app_proto = scan_udp(target_ip, port, timeout, guess)
+            if not is_open:
+                return None
 
-        parts = ["UDP", str(port)]
-        # Для UDP время ответа в режиме -v не выводится по условию задачи
-        if guess:
-            parts.append(app_proto)
-        return " ".join(parts)
+            parts = ["UDP", str(port)]
+            if guess:
+                parts.append(app_proto)
+            return " ".join(parts)
+    except Exception:
+        return None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
