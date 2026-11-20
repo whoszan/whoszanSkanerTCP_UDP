@@ -1,548 +1,463 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-portscan - сканер TCP и UDP портов (Linux, требуются права root / CAP_NET_RAW).
-
-    portscan [OPTIONS] IP_ADDRESS [{tcp|udp}[/[PORT|PORT-PORT],...]]...
-
-TCP: SYN-сканирование. IP- и TCP-заголовки формируются вручную, на каждый
-     SYN-ACK отправляется RST, поэтому полуоткрытых соединений не остаётся.
-UDP: отправка датаграммы + приём ICMP "port unreachable" через raw-сокет.
-     Порт считается открытым, если пришёл ответ либо ICMP-ошибка не пришла.
-Параллелизм: неблокирующие сокеты + selectors (epoll/poll/select),
-     при -j > 1 порты делятся между потоками, каждый со своим циклом событий.
-
-Запуск:  sudo python3 skaner.py [OPTIONS] IP_ADDRESS tcp/80 udp/50-60,100
-"""
-
 import argparse
-import errno
-import ipaddress
-import os
+from concurrent.futures import ThreadPoolExecutor
 import random
-import re
-import selectors
+import select
 import socket
 import struct
 import sys
-import threading
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
-PROG = "portscan"
-
-TCP_WINDOW = 1024     # максимум одновременно ожидающих ответа TCP-проб
-UDP_WINDOW = 256      # то же для UDP
-SEND_BATCH = 64       # сколько пакетов отправлять между опросами сокетов
-ATTEMPTS = 2          # число отправок пробы в пределах одного таймаута
-
-FLAG_RST = 0x04
-FLAG_SYN = 0x02
-FLAG_ACK = 0x10
+# Полезные нагрузки (payloads) для определения протоколов (-g)
+ECHO_PAYLOAD = b"PORTSCAN_ECHO_TEST_42\r\n"
+DNS_TID = b"\x13\x37"
+# Стандартный DNS-запрос (A-запись для example.com)
+DNS_QUERY = (
+    DNS_TID
+    + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    + b"\x07example\x03com\x00\x00\x01\x00\x01"
+)
 
 
-# --------------------------------------------------------------------------
-# Разбор аргументов
-# --------------------------------------------------------------------------
-
-PORT_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
-
-
-def parse_ports(text, parser):
-    """Разбирает 'PORT|PORT-PORT,...' в множество портов."""
-    result = set()
-    for part in text.split(","):
-        m = PORT_RE.match(part.strip())
-        if not m:
-            parser.error("некорректное описание портов: '%s'" % part)
-        lo = int(m.group(1))
-        hi = int(m.group(2)) if m.group(2) is not None else lo
-        if lo < 1 or hi > 65535 or lo > hi:
-            parser.error("некорректный диапазон портов: '%s'" % part)
-        result.update(range(lo, hi + 1))
-    return result
-
-
-def parse_args(argv):
-    parser = argparse.ArgumentParser(
-        prog=PROG,
-        usage="%(prog)s [OPTIONS] IP_ADDRESS [{tcp|udp}[/[PORT|PORT-PORT],...]]...",
-        description="Сканер TCP (SYN) и UDP портов.",
-    )
-    parser.add_argument("--timeout", type=float, default=2.0,
-                        help="таймаут ожидания ответа, с (по умолчанию 2)")
-    parser.add_argument("-j", "--num-threads", dest="threads", type=int, default=1,
-                        help="число потоков")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="подробный режим (время ответа)")
-    parser.add_argument("-g", "--guess", action="store_true",
-                        help="определение протокола прикладного уровня")
-    parser.add_argument("ip", metavar="IP_ADDRESS", help="IPv4-адрес цели")
-    parser.add_argument("specs", metavar="{tcp|udp}[/PORTS]", nargs="*",
-                        help="протокол и порты, например tcp/80 udp/50-60,100")
-    args = parser.parse_intermixed_args(argv)
-
-    if args.timeout <= 0 or args.timeout != args.timeout:
-        parser.error("--timeout должен быть положительным числом")
-    if args.threads < 1:
-        parser.error("число потоков должно быть не меньше 1")
-
-    try:
-        addr = ipaddress.ip_address(args.ip)
-    except ValueError:
-        parser.error("некорректный IP-адрес: '%s'" % args.ip)
-    if addr.version != 4:
-        parser.error("поддерживаются только IPv4-адреса")
-    args.ip = str(addr)
-
-    order = []                       # порядок протоколов по первому упоминанию
-    ports = {"tcp": set(), "udp": set()}
-    for spec in args.specs:
-        proto, slash, rest = spec.partition("/")
-        proto = proto.lower()
-        if proto not in ports:
-            parser.error("неизвестный протокол: '%s'" % spec)
-        if proto not in order:
-            order.append(proto)
-        if not slash or rest == "":
-            ports[proto].update(range(1, 65536))
-        else:
-            ports[proto].update(parse_ports(rest, parser))
-    args.order = order
-    args.ports = {p: sorted(v) for p, v in ports.items()}
-    return args
-
-
-# --------------------------------------------------------------------------
-# Ручное формирование пакетов
-# --------------------------------------------------------------------------
-
-def checksum(data):
-    if len(data) % 2:
+def calculate_checksum(data: bytes) -> int:
+    """Вычисление контрольной суммы RFC 1071 (для TCP заголовка)."""
+    if len(data) % 2 != 0:
         data += b"\x00"
-    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
-    s = (s >> 16) + (s & 0xFFFF)
-    s += s >> 16
-    return ~s & 0xFFFF
+    checksum = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        checksum += word
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    return ~checksum & 0xFFFF
 
 
-def build_tcp(src, dst, sport, dport, seq, ack, flags, options=b"", window=64240):
-    offset = ((20 + len(options)) // 4) << 4
-    hdr = struct.pack("!HHIIBBHHH", sport, dport, seq, ack, offset, flags,
-                      window, 0, 0) + options
-    pseudo = src + dst + struct.pack("!BBH", 0, socket.IPPROTO_TCP, len(hdr))
-    ck = checksum(pseudo + hdr)
-    return hdr[:16] + struct.pack("!H", ck) + hdr[18:]
+def get_local_ip(target_ip: str) -> str:
+    """Определяет локальный IP-адрес интерфейса, через который идет маршрут к цели."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect((target_ip, 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
 
 
-def build_ip(src, dst, payload, proto=socket.IPPROTO_TCP):
-    hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload),
-                      random.getrandbits(16), 0x4000, 64, proto, 0, src, dst)
-    ck = checksum(hdr)
-    hdr = hdr[:10] + struct.pack("!H", ck) + hdr[12:]
-    return hdr + payload
+def build_tcp_packet(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    seq: int,
+    ack_seq: int,
+    flags: int,
+) -> bytes:
+    """Ручная сборка TCP-заголовка с вычислением контрольной суммы."""
+    data_offset = 5 << 4  # 5 слов по 32 бита = 20 байт (без опций)
+    window = socket.htons(5840)
+    checksum = 0
+    urg_ptr = 0
+
+    # Собираем заголовок с нулевой контрольной суммой
+    tcp_header = struct.pack(
+        "!HHIIBBHHH",
+        src_port,
+        dst_port,
+        seq,
+        ack_seq,
+        data_offset,
+        flags,
+        window,
+        checksum,
+        urg_ptr,
+    )
+
+    # Псевдозаголовок IPv4 для расчета контрольной суммы TCP
+    src_ip_bytes = socket.inet_aton(src_ip)
+    dst_ip_bytes = socket.inet_aton(dst_ip)
+    placeholder = 0
+    protocol = socket.IPPROTO_TCP
+    tcp_length = len(tcp_header)
+
+    pseudo_header = struct.pack(
+        "!4s4sBBH",
+        src_ip_bytes,
+        dst_ip_bytes,
+        placeholder,
+        protocol,
+        tcp_length,
+    )
+
+    checksum = calculate_checksum(pseudo_header + tcp_header)
+
+    # Пересобираем заголовок с правильной контрольной суммой
+    tcp_header = struct.pack(
+        "!HHIIBBHHH",
+        src_port,
+        dst_port,
+        seq,
+        ack_seq,
+        data_offset,
+        flags,
+        window,
+        checksum,
+        urg_ptr,
+    )
+    return tcp_header
 
 
-MSS_OPTION = struct.pack("!BBH", 2, 4, 1460)
+def scan_tcp_syn(
+    local_ip: str, target_ip: str, port: int, timeout: float
+) -> tuple[bool, int]:
+    """TCP SYN сканирование (полуоткрытое).
+
+    Возвращает (is_open, rtt_ms).
+    """
+    src_port = random.randint(32768, 60999)
+    seq = random.randint(1000, 1000000)
+
+    # Флаг SYN = 0x02
+    syn_packet = build_tcp_packet(
+        local_ip, target_ip, src_port, port, seq, 0, 0x02
+    )
+
+    with socket.socket(
+        socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
+    ) as sock:
+        start_time = time.perf_counter()
+        sock.sendto(syn_packet, (target_ip, port))
+
+        while True:
+            elapsed = time.perf_counter() - start_time
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                return False, 0
+
+            ready, _, _ = select.select([sock], [], [], remaining)
+            if not ready:
+                return False, 0
+
+            packet, addr = sock.recvfrom(1024)
+            if addr[0] != target_ip:
+                continue
+
+            # Длина IP-заголовка (IHL) находится в младших 4 битах первого байта
+            ip_header_len = (packet[0] & 0x0F) * 4
+            if len(packet) < ip_header_len + 20:
+                continue
+
+            tcp_header = packet[ip_header_len : ip_header_len + 20]
+            r_src_port, r_dst_port, r_seq, r_ack, _, r_flags, _, _, _ = (
+                struct.unpack("!HHIIBBHHH", tcp_header)
+            )
+
+            # Проверяем, что пакет адресован именно нашему потоку и от нужного порта
+            if r_src_port == port and r_dst_port == src_port:
+                rtt_ms = int(round((time.perf_counter() - start_time) * 1000))
+
+                # Если пришли флаги SYN (0x02) + ACK (0x10) = 0x12 -> Порт ОТКРЫТ
+                if (r_flags & 0x12) == 0x12:
+                    # Отправляем RST (0x04), чтобы закрыть полуоткрытое соединение!
+                    rst_packet = build_tcp_packet(
+                        local_ip, target_ip, src_port, port, r_ack, 0, 0x04
+                    )
+                    sock.sendto(rst_packet, (target_ip, port))
+                    return True, rtt_ms
+
+                # Если пришел флаг RST (0x04) -> Порт ЗАКРЫТ
+                if (r_flags & 0x04) != 0:
+                    return False, 0
 
 
-def local_ip_for(target):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def guess_tcp_protocol(target_ip: str, port: int, timeout: float) -> str:
+    """Определение протокола прикладного уровня поверх TCP (ECHO, HTTP, DNS)."""
+    # 1. Проверка на ECHO
     try:
-        s.connect((target, 9))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
-
-# --------------------------------------------------------------------------
-# TCP SYN-сканирование
-# --------------------------------------------------------------------------
-
-def make_tcp_sockets():
-    send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    try:
-        recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        with socket.create_connection((target_ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(ECHO_PAYLOAD)
+            resp = s.recv(1024)
+            if resp == ECHO_PAYLOAD:
+                return "ECHO"
     except Exception:
-        send_sock.close()
-        raise
-    try:
-        recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    except OSError:
         pass
-    recv_sock.setblocking(False)
-    return send_sock, recv_sock
 
-
-def tcp_worker(target, src_ip, ports, sport, timeout, send_sock, recv_sock, out):
-    """Цикл событий одного потока: отправка SYN, приём SYN-ACK/RST."""
-    dst = socket.inet_aton(target)
-    src = socket.inet_aton(src_ip)
-    sel = selectors.DefaultSelector()
-    sel.register(recv_sock, selectors.EVENT_READ)
-    attempt_wait = timeout / ATTEMPTS
-
-    queue = deque(ports)
-    pending = {}   # порт -> [seq, время последней отправки, число отправок]
-
-    def send_segment(dport, seq, ack, flags, options=b""):
-        seg = build_tcp(src, dst, sport, dport, seq, ack, flags, options)
-        send_sock.sendto(build_ip(src, dst, seg), (target, 0))
-
-    def handle(data):
-        if len(data) < 40 or data[9] != socket.IPPROTO_TCP or data[12:16] != dst:
-            return
-        ihl = (data[0] & 0x0F) * 4
-        tcp = data[ihl:ihl + 20]
-        if len(tcp) < 20:
-            return
-        rsport, rdport, _seq, ack, _off, flags = struct.unpack("!HHIIBB", tcp[:14])
-        if rdport != sport:
-            return
-        st = pending.get(rsport)
-        if flags & (FLAG_SYN | FLAG_ACK) == (FLAG_SYN | FLAG_ACK):
-            # порт открыт: сразу сбрасываем соединение (RST), чтобы не оставлять
-            # полуоткрытых подключений на цели
-            try:
-                send_segment(rsport, ack, 0, FLAG_RST)
-            except OSError:
-                pass
-            if st is not None and ack == (st[0] + 1) & 0xFFFFFFFF:
-                out[rsport] = (time.monotonic() - st[1]) * 1000.0
-                del pending[rsport]
-        elif flags & FLAG_RST:
-            if st is not None and flags & FLAG_ACK and ack == (st[0] + 1) & 0xFFFFFFFF:
-                del pending[rsport]
-
+    # 2. Проверка на HTTP
     try:
-        while queue or pending:
-            # --- отправка очередной порции SYN
-            sent = 0
-            while queue and len(pending) < TCP_WINDOW and sent < SEND_BATCH:
-                port = queue.popleft()
-                seq = random.getrandbits(32)
-                try:
-                    send_segment(port, seq, 0, FLAG_SYN, MSS_OPTION)
-                except OSError as e:
-                    if e.errno in (errno.ENOBUFS, errno.EAGAIN, errno.EINTR):
-                        queue.appendleft(port)
-                        time.sleep(0.001)
-                        break
-                    sent += 1
-                    continue
-                pending[port] = [seq, time.monotonic(), 1]
-                sent += 1
-
-            # --- ожидание ответов
-            more = bool(queue) and len(pending) < TCP_WINDOW
-            if sel.select(0 if more else 0.02):
-                for _ in range(4096):
-                    try:
-                        data = recv_sock.recv(65535)
-                    except (BlockingIOError, InterruptedError):
-                        break
-                    except OSError:
-                        break
-                    handle(data)
-
-            # --- повторная отправка / истечение таймаута
-            now = time.monotonic()
-            for port, st in list(pending.items()):
-                if now - st[1] >= attempt_wait:
-                    if st[2] < ATTEMPTS:
-                        try:
-                            send_segment(port, st[0], 0, FLAG_SYN, MSS_OPTION)
-                        except OSError:
-                            pass
-                        st[1] = now
-                        st[2] += 1
-                    else:
-                        del pending[port]
-    finally:
-        sel.close()
-
-
-def scan_tcp(target, ports, timeout, threads):
-    src_ip = local_ip_for(target)
-    threads = max(1, min(threads, len(ports)))
-    socks = [make_tcp_sockets() for _ in range(threads)]
-    base = random.randint(33000, 60000 - threads)
-    outs = [dict() for _ in range(threads)]
-    workers = []
-    try:
-        for i in range(threads):
-            t = threading.Thread(
-                target=tcp_worker,
-                args=(target, src_ip, ports[i::threads], base + i, timeout,
-                      socks[i][0], socks[i][1], outs[i]),
-                daemon=True)
-            t.start()
-            workers.append(t)
-        for t in workers:
-            while t.is_alive():
-                t.join(0.2)
-    finally:
-        for s, r in socks:
-            s.close()
-            r.close()
-    result = {}
-    for o in outs:
-        result.update(o)
-    return result    # порт -> время ответа, мс
-
-
-# --------------------------------------------------------------------------
-# UDP-сканирование
-# --------------------------------------------------------------------------
-
-def dns_query(qid):
-    return (qid + struct.pack("!HHHHH", 0x0100, 1, 0, 0, 0)
-            + b"\x07example\x03com\x00" + struct.pack("!HH", 1, 1))
-
-
-def is_dns_response(data, qid):
-    return len(data) >= 12 and data[:2] == qid and bool(data[2] & 0x80)
-
-
-def make_udp_sockets():
-    icmp = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    try:
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with socket.create_connection((target_ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            http_req = f"GET / HTTP/1.1\r\nHost: {target_ip}\r\nConnection: close\r\n\r\n".encode()
+            s.sendall(http_req)
+            resp = s.recv(1024)
+            if resp.startswith(b"HTTP/"):
+                return "HTTP"
     except Exception:
-        icmp.close()
-        raise
-    udp.bind(("", 0))
-    udp.setblocking(False)
-    icmp.setblocking(False)
-    try:
-        icmp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    except OSError:
         pass
-    return udp, icmp
 
-
-def udp_worker(target, ports, payload, timeout, udp, icmp, out):
-    dst = socket.inet_aton(target)
-    lport = udp.getsockname()[1]
-    sel = selectors.DefaultSelector()
-    sel.register(udp, selectors.EVENT_READ, "udp")
-    sel.register(icmp, selectors.EVENT_READ, "icmp")
-    attempt_wait = timeout / ATTEMPTS
-
-    queue = deque(ports)
-    pending = {}   # порт -> [время последней отправки, число отправок]
-
-    def send_probe(port):
-        udp.sendto(payload, (target, port))
-
-    def handle_icmp(d):
-        if len(d) < 28:
-            return
-        ihl = (d[0] & 0x0F) * 4
-        if len(d) < ihl + 8 + 20 or d[ihl] != 3:       # Destination Unreachable
-            return
-        inner = d[ihl + 8:]
-        iihl = (inner[0] & 0x0F) * 4
-        if inner[9] != socket.IPPROTO_UDP or inner[16:20] != dst or len(inner) < iihl + 4:
-            return
-        isport, idport = struct.unpack("!HH", inner[iihl:iihl + 4])
-        if isport == lport:
-            pending.pop(idport, None)
-
+    # 3. Проверка на DNS (поверх TCP перед запросом идет 2 байта длины)
     try:
-        while queue or pending:
-            sent = 0
-            while queue and len(pending) < UDP_WINDOW and sent < SEND_BATCH:
-                port = queue.popleft()
-                try:
-                    send_probe(port)
-                except OSError as e:
-                    if e.errno in (errno.ENOBUFS, errno.EAGAIN, errno.EINTR):
-                        queue.appendleft(port)
-                        time.sleep(0.001)
-                        break
-                    sent += 1
-                    continue
-                pending[port] = [time.monotonic(), 1]
-                sent += 1
+        with socket.create_connection((target_ip, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            tcp_dns_req = struct.pack("!H", len(DNS_QUERY)) + DNS_QUERY
+            s.sendall(tcp_dns_req)
+            resp = s.recv(1024)
+            # Проверяем Transaction ID и бит ответа QR (0x80)
+            if (
+                len(resp) >= 14
+                and resp[2:4] == DNS_TID
+                and (resp[4] & 0x80) != 0
+            ):
+                return "DNS"
+    except Exception:
+        pass
 
-            more = bool(queue) and len(pending) < UDP_WINDOW
-            for key, _ in sel.select(0 if more else 0.02):
-                for _ in range(4096):
-                    try:
-                        if key.data == "udp":
-                            data, addr = udp.recvfrom(65535)
-                            if addr[0] == target and addr[1] in pending:
-                                out[addr[1]] = data
-                                del pending[addr[1]]
-                        else:
-                            handle_icmp(icmp.recv(65535))
-                    except (BlockingIOError, InterruptedError):
-                        break
-                    except OSError:
-                        break
-
-            now = time.monotonic()
-            for port, st in list(pending.items()):
-                if now - st[0] >= attempt_wait:
-                    if st[1] < ATTEMPTS:
-                        try:
-                            send_probe(port)
-                        except OSError:
-                            pass
-                        st[0] = now
-                        st[1] += 1
-                    else:
-                        # ни ответа, ни ICMP "unreachable" - open|filtered
-                        out.setdefault(port, None)
-                        del pending[port]
-    finally:
-        sel.close()
-
-
-def scan_udp(target, ports, payload, timeout, threads):
-    threads = max(1, min(threads, len(ports)))
-    socks = [make_udp_sockets() for _ in range(threads)]
-    outs = [dict() for _ in range(threads)]
-    workers = []
-    try:
-        for i in range(threads):
-            t = threading.Thread(
-                target=udp_worker,
-                args=(target, ports[i::threads], payload, timeout,
-                      socks[i][0], socks[i][1], outs[i]),
-                daemon=True)
-            t.start()
-            workers.append(t)
-        for t in workers:
-            while t.is_alive():
-                t.join(0.2)
-    finally:
-        for u, i in socks:
-            u.close()
-            i.close()
-    result = {}
-    for o in outs:
-        result.update(o)
-    return result    # порт -> ответ (bytes) или None
-
-
-# --------------------------------------------------------------------------
-# Определение протокола прикладного уровня
-# --------------------------------------------------------------------------
-
-def tcp_exchange(ip, port, data, timeout, min_len=1):
-    """Обычное соединение: отправить data и прочитать ответ."""
-    s = None
-    try:
-        s = socket.create_connection((ip, port), timeout)
-        s.sendall(data)
-        deadline = time.monotonic() + timeout
-        buf = b""
-        while len(buf) < min_len:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                break
-            s.settimeout(left)
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        return buf
-    except OSError:
-        return b""
-    finally:
-        if s is not None:
-            try:
-                s.close()
-            except OSError:
-                pass
-
-
-def guess_tcp(ip, port, timeout):
-    req = (b"GET / HTTP/1.1\r\nHost: " + ip.encode()
-           + b"\r\nUser-Agent: portscan\r\nAccept: */*\r\nConnection: close\r\n\r\n")
-    resp = tcp_exchange(ip, port, req, timeout, 5)
-    if resp:
-        if resp.startswith(b"HTTP/"):
-            return "HTTP"
-        if resp[:len(req)] == req[:len(resp)]:
-            return "ECHO"
-
-    qid = os.urandom(2)
-    query = dns_query(qid)
-    resp = tcp_exchange(ip, port, struct.pack("!H", len(query)) + query, timeout, 14)
-    if len(resp) >= 14 and resp[2:4] == qid and resp[4] & 0x80:
-        return "DNS"
     return "-"
 
 
-def guess_udp(response, qid, payload):
-    if not response:
-        return "-"
-    if response == payload:
+def check_udp_response_protocol(resp: bytes) -> str:
+    """Анализирует ответный UDP-пакет на принадлежность к ECHO, DNS или HTTP."""
+    if resp == ECHO_PAYLOAD:
         return "ECHO"
-    if is_dns_response(response, qid):
+    if len(resp) >= 12 and resp[0:2] == DNS_TID and (resp[2] & 0x80) != 0:
         return "DNS"
-    if response.startswith(b"HTTP/"):
+    if resp.startswith(b"HTTP/"):
         return "HTTP"
     return "-"
 
 
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
+def scan_udp(
+    target_ip: str, port: int, timeout: float, guess: bool
+) -> tuple[bool, str]:
+    """UDP сканирование с перехватом ICMP Port Unreachable и угадыванием протокола.
 
-def main(argv=None):
-    args = parse_args(sys.argv[1:] if argv is None else argv)
-    target = args.ip
-    rows = []   # (протокол, порт, время или None, протокол приклад. уровня)
+    Возвращает (is_open, protocol).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock, (
+        socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    ) as icmp_sock:
+
+        udp_sock.bind(("", 0))
+        src_port = udp_sock.getsockname()[1]
+
+        # Формируем список пакетов для отправки
+        http_req = f"GET / HTTP/1.1\r\nHost: {target_ip}\r\n\r\n".encode()
+        probes = [DNS_QUERY, ECHO_PAYLOAD, http_req] if guess else [DNS_QUERY]
+
+        start_time = time.perf_counter()
+        for probe in probes:
+            udp_sock.sendto(probe, (target_ip, port))
+
+        while True:
+            elapsed = time.perf_counter() - start_time
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                # За время таймаута ICMP-ошибка "Порт недоступен" НЕ пришла -> порт открыт (или отфильтрован)
+                return True, "-"
+
+            ready, _, _ = select.select(
+                [udp_sock, icmp_sock], [], [], remaining
+            )
+            if not ready:
+                return True, "-"
+
+            # Если пришел прямой UDP-ответ, порт точно ОТКРЫТ
+            if udp_sock in ready:
+                try:
+                    data, addr = udp_sock.recvfrom(2048)
+                    if addr[0] == target_ip and addr[1] == port:
+                        proto = (
+                            check_udp_response_protocol(data) if guess else "-"
+                        )
+                        return True, proto
+                except Exception:
+                    return False, "-"
+
+            # Если пришел ICMP-пакет, проверяем не Destination/Port Unreachable ли это
+            if icmp_sock in ready:
+                packet, addr = icmp_sock.recvfrom(2048)
+                if addr[0] != target_ip:
+                    continue
+
+                ip_hdr_len = (packet[0] & 0x0F) * 4
+                icmp_packet = packet[ip_hdr_len:]
+                if len(icmp_packet) < 8:
+                    continue
+
+                icmp_type, icmp_code = struct.unpack("!BB", icmp_packet[:2])
+                # Type 3 (Destination Unreachable), Code 3 (Port Unreachable)
+                if icmp_type == 3 and icmp_code == 3:
+                    # Внутри ICMP-пакета лежит IP-заголовок и первые 8 байт нашего исходного UDP-пакета
+                    orig_ip_pkt = icmp_packet[8:]
+                    if len(orig_ip_pkt) < 20:
+                        continue
+                    orig_ip_hdr_len = (orig_ip_pkt[0] & 0x0F) * 4
+                    orig_udp_hdr = orig_ip_pkt[
+                        orig_ip_hdr_len : orig_ip_hdr_len + 8
+                    ]
+                    if len(orig_udp_hdr) >= 4:
+                        orig_src_p, orig_dst_p = struct.unpack(
+                            "!HH", orig_udp_hdr[:4]
+                        )
+                        if orig_src_p == src_port and orig_dst_p == port:
+                            return False, "-"
+
+
+def parse_target_specs(specs: list[str]) -> list[tuple[str, int]]:
+    """Парсит аргументы вида: tcp/80, tcp/12000-12500, udp/3000-3100,3200, tcp."""
+    tasks = []
+    seen = set()
+
+    for spec in specs:
+        if "/" in spec:
+            proto_part, ports_part = spec.split("/", 1)
+        else:
+            proto_part, ports_part = spec, "1-65535"
+
+        proto = proto_part.upper()
+        if proto not in ("TCP", "UDP"):
+            raise ValueError(f"Неизвестный протокол: {proto_part}")
+
+        if not ports_part:
+            raise ValueError(f"Пустой список портов в: {spec}")
+
+        for item in ports_part.split(","):
+            if "-" in item:
+                start_s, end_s = item.split("-", 1)
+                start_p, end_p = int(start_s), int(end_s)
+                if not (1 <= start_p <= 65535 and 1 <= end_p <= 65535):
+                    raise ValueError(f"Порт вне диапазона 1-65535: {item}")
+                if start_p > end_p:
+                    raise ValueError(f"Неверный диапазон портов: {item}")
+                for p in range(start_p, end_p + 1):
+                    if (proto, p) not in seen:
+                        seen.add((proto, p))
+                        tasks.append((proto, p))
+            else:
+                p = int(item)
+                if not (1 <= p <= 65535):
+                    raise ValueError(f"Порт вне диапазона 1-65535: {p}")
+                if (proto, p) not in seen:
+                    seen.add((proto, p))
+                    tasks.append((proto, p))
+
+    return tasks
+
+
+def process_task(
+    task: tuple[str, int],
+    local_ip: str,
+    target_ip: str,
+    timeout: float,
+    verbose: bool,
+    guess: bool,
+) -> str | None:
+    """Обрабатывает один порт и возвращает отформатированную строку вывода (если открыт)."""
+    proto, port = task
+
+    if proto == "TCP":
+        is_open, rtt_ms = scan_tcp_syn(local_ip, target_ip, port, timeout)
+        if not is_open:
+            return None
+        app_proto = (
+            guess_tcp_protocol(target_ip, port, timeout) if guess else ""
+        )
+
+        parts = ["TCP", str(port)]
+        if verbose:
+            parts.append(str(rtt_ms))
+        if guess:
+            parts.append(app_proto)
+        return " ".join(parts)
+
+    else:  # UDP
+        is_open, app_proto = scan_udp(target_ip, port, timeout, guess)
+        if not is_open:
+            return None
+
+        parts = ["UDP", str(port)]
+        # Для UDP время ответа в режиме -v не выводится по условию задачи
+        if guess:
+            parts.append(app_proto)
+        return " ".join(parts)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="portscan",
+        description="Сканер TCP и UDP портов",
+        usage=(
+            "portscan [OPTIONS] IP_ADDRESS"
+            " [{tcp|udp}[/[PORT|PORT-PORT],...]]..."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=2.0,
+        help="таймаут ожидания ответа (по умолчанию 2с)",
+    )
+    parser.add_argument(
+        "-j",
+        "--num-threads",
+        type=int,
+        default=10,
+        help="число потоков (по умолчанию 10)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="подробный режим"
+    )
+    parser.add_argument(
+        "-g",
+        "--guess",
+        action="store_true",
+        help="определение протокола прикладного уровня",
+    )
+    parser.add_argument("ip_address", metavar="IP_ADDRESS", help="целевой IP")
+    parser.add_argument(
+        "targets", nargs="+", help="список протоколов и диапазонов портов"
+    )
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
+    try:
+        args = parser.parse_args()
+        if args.timeout <= 0 or args.num_threads <= 0:
+            raise ValueError("timeout и num-threads должны быть больше 0")
+        target_ip = socket.gethostbyname(args.ip_address)
+        tasks = parse_target_specs(args.targets)
+    except Exception as e:
+        sys.stderr.write(f"Ошибка параметров запуска: {e}\n")
+        sys.exit(2)
+
+    local_ip = get_local_ip(target_ip)
 
     try:
-        for proto in args.order:
-            ports = args.ports[proto]
-            if not ports:
-                continue
-            if proto == "tcp":
-                found = scan_tcp(target, ports, args.timeout, args.threads)
-                guesses = {}
-                if args.guess and found:
-                    with ThreadPoolExecutor(max_workers=max(args.threads, 4)) as ex:
-                        futs = {p: ex.submit(guess_tcp, target, p, args.timeout)
-                                for p in found}
-                        guesses = {p: f.result() for p, f in futs.items()}
-                for p in sorted(found):
-                    rows.append(("TCP", p, found[p], guesses.get(p, "-")))
-            else:
-                qid = os.urandom(2)
-                payload = dns_query(qid)
-                found = scan_udp(target, ports, payload, args.timeout, args.threads)
-                for p in sorted(found):
-                    g = guess_udp(found[p], qid, payload) if args.guess else "-"
-                    rows.append(("UDP", p, None, g))
+        with ThreadPoolExecutor(max_workers=args.num_threads) as executor:
+            futures = [
+                executor.submit(
+                    process_task,
+                    task,
+                    local_ip,
+                    target_ip,
+                    args.timeout,
+                    args.verbose,
+                    args.guess,
+                )
+                for task in tasks
+            ]
+            for future in futures:
+                result = future.result()
+                if result is not None:
+                    print(result)
     except PermissionError:
-        sys.stderr.write("%s: для работы с raw-сокетами нужны права root\n" % PROG)
-        return 1
-    except OSError as e:
-        sys.stderr.write("%s: ошибка: %s\n" % (PROG, e))
-        return 1
+        sys.stderr.write(
+            "Ошибка: Для работы сокетов (RAW SOCKETS) требуются права"
+            " суперпользователя (запустите через sudo).\n"
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
-        return 130
-
-    out = []
-    for proto, port, ms, guess in rows:
-        cols = [proto, str(port)]
-        if args.verbose:
-            cols.append("%d" % round(ms) if ms is not None else "-")
-        if args.guess:
-            cols.append(guess)
-        out.append(" ".join(cols))
-    if out:
-        sys.stdout.write("\n".join(out) + "\n")
-    sys.stdout.flush()
-    return 0
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
